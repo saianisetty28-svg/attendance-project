@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Profile - Attendance</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body class="has-sidebar">
+    <div class="sidebar">
+        <div class="sidebar-header">Attendance</div>
+        <nav class="sidebar-nav">
+            <a href="dashboard.html">Dashboard</a>
+            <a href="attendance.html">Attendance</a>
+            <div class="settings-item">
+                <a href="#" id="settingsToggle" class="settings-link">Settings ▾</a>
+                <div class="settings-menu" id="settingsMenu">
+                    <a href="profile.html">Profile</a>
+                    <button id="sidebarLogout" class="link-button">Logout</button>
+                </div>
+            </div>
+        </nav>
+    </div>
+    <div class="container wide">
+        <div class="card custom-card">
+            <h1>Profile</h1>
+            <p class="subtitle">Your account details</p>
+            <nav class="nav">
+                <a href="dashboard.html">Dashboard</a>
+                <button type="button" class="link-btn" id="logoutBtn">Logout</button>
+            </nav>
+            <div id="message" class="message" hidden></div>
+            <div class="info-box" id="profileContent"><p>Loading...</p></div>
+        </div>
+    </div>
+    <script src="js/api.js"></script>
+    <script>
+        requireAuth();
+        const messageEl = document.getElementById("message");
+        const contentEl = document.getElementById("profileContent");
+        async function loadProfile() {
+            const data = await apiGetWithRefresh("/profile");
+            if (data.user) {
+                const u = data.user;
+                contentEl.innerHTML = "<p><strong>Name:</strong> " + (u.name || "") + "</p>"
+                    + "<p><strong>Email:</strong> " + (u.email || "") + "</p>"
+                    + "<p><strong>Role:</strong> " + (u.role || "") + "</p>";
+                return;
+            }
+            showMessage(messageEl, data.message || "Could not load profile", true);
+        }
+        const logoutBtn = document.getElementById("logoutBtn");
+        if (logoutBtn) {
+            logoutBtn.addEventListener("click", async () => {
+                await apiPost("/logout", {}, true);
+                clearAuth();
+                window.location.href = "login.html";
+            });
+        }
+
+        // Sidebar settings toggle & logout
+        const settingsToggle = document.getElementById('settingsToggle');
+        const settingsMenu = document.getElementById('settingsMenu');
+        if (settingsToggle && settingsMenu) {
+            settingsToggle.addEventListener('click', (e) => {
+                e.preventDefault();
+                settingsMenu.classList.toggle('open');
+            });
+            document.addEventListener('click', (e) => {
+                if (!settingsMenu.contains(e.target) && e.target !== settingsToggle) {
+                    settingsMenu.classList.remove('open');
+                }
+            });
+        }
+
+        const sidebarLogout = document.getElementById('sidebarLogout');
+        if (sidebarLogout) {
+            sidebarLogout.addEventListener('click', async () => {
+                await apiPost('/logout', {}, true);
+                clearAuth();
+                window.location.href = 'login.html';
+            });
+        }
+
+        loadProfile();
+    </script>

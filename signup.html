@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign up - Attendance</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>Sign up</h1>
+            <p class="subtitle">Create a new account</p>
+
+            <div id="message" class="message" hidden></div>
+
+            <form id="signupForm">
+                <label for="name">Full name</label>
+                <input type="text" id="name" name="name" required autocomplete="name">
+
+                <label for="email">Email</label>
+                <input type="email" id="email" name="email" required autocomplete="email">
+
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required autocomplete="new-password">
+                <div class="password-requirements" id="pwdReq" hidden>
+                    <p>Password must contain:</p>
+                    <ul>
+                        <li id="req-length">At least 8 characters</li>
+                        <li id="req-lower">One lowercase letter</li>
+                        <li id="req-upper">One uppercase letter</li>
+                        <li id="req-digit">One number</li>
+                        <li id="req-special">One special character (e.g. !@#$%)</li>
+                    </ul>
+                </div>
+
+                <button type="submit">Create account</button>
+            </form>
+
+            <div class="links">
+                <a href="login.html">Already have an account? Login</a>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/api.js"></script>
+    <script>
+        redirectIfLoggedIn();
+
+        const form = document.getElementById("signupForm");
+        const messageEl = document.getElementById("message");
+
+            function validatePassword(pw) {
+                const results = {};
+                results.length = pw.length >= 8;
+                results.lower = /[a-z]/.test(pw);
+                results.upper = /[A-Z]/.test(pw);
+                results.digit = /[0-9]/.test(pw);
+                results.special = /[^A-Za-z0-9]/.test(pw);
+                return results;
+            }
+
+            form.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            showMessage(messageEl, "", false);
+
+            const name = document.getElementById("name").value.trim();
+            const email = document.getElementById("email").value.trim();
+            const password = document.getElementById("password").value;
+
+                // client-side password validation
+                const check = validatePassword(password);
+                const pwdReqEl = document.getElementById('pwdReq');
+                pwdReqEl.hidden = true;
+                document.getElementById('req-length').style.opacity = check.length ? '0.6' : '1';
+                document.getElementById('req-lower').style.opacity = check.lower ? '0.6' : '1';
+                document.getElementById('req-upper').style.opacity = check.upper ? '0.6' : '1';
+                document.getElementById('req-digit').style.opacity = check.digit ? '0.6' : '1';
+                document.getElementById('req-special').style.opacity = check.special ? '0.6' : '1';
+
+                const allOk = check.length && check.lower && check.upper && check.digit && check.special;
+                if (!allOk) {
+                    showMessage(messageEl, 'Password does not meet requirements', true);
+                    pwdReqEl.hidden = false;
+                    return;
+                }
+
+            const data = await apiPost("/signup", { name, email, password });
+
+            if (data.message === "Signup successful") {
+                showMessage(messageEl, "Account created! Redirecting to login...", false);
+                setTimeout(() => {
+                    window.location.href = "login.html";
+                }, 1500);
+                return;
+            }
+
+            // If backend returns a specific password error, show requirements as well
+            if ((data.message || '').toLowerCase().includes('password')) {
+                document.getElementById('pwdReq').hidden = false;
+                showMessage(messageEl, data.message || 'Password invalid', true);
+                return;
+            }
+
+            showMessage(messageEl, data.message || "Signup failed", true);
+        });
+    </script>
+</body>
+</html>

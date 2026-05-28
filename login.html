@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - Attendance</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>Login</h1>
+            <p class="subtitle">Sign in to your account</p>
+
+            <div id="message" class="message" hidden></div>
+
+            <form id="loginForm">
+                <label for="email">Email</label>
+                <input type="email" id="email" name="email" required autocomplete="email">
+
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required autocomplete="current-password">
+
+                <button type="submit">Login</button>
+            </form>
+
+            <div class="links">
+                <a href="forgot-password.html">Forgot password?</a><br><br>
+                <a href="signup.html">Create an account</a>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/api.js"></script>
+    <script>
+        redirectIfLoggedIn();
+
+        const form = document.getElementById("loginForm");
+        const messageEl = document.getElementById("message");
+
+        form.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            showMessage(messageEl, "", false);
+
+            const email = document.getElementById("email").value.trim();
+            const password = document.getElementById("password").value;
+
+            const data = await apiPost("/login", { email, password });
+
+            if (data.access_token) {
+                setTokens(data.access_token, data.refresh_token);
+                setUser(data.user);
+                window.location.href = "dashboard.html";
+                return;
+            }
+
+            showMessage(messageEl, data.message || "Login failed", true);
+        });
+    </script>
+</body>
+</html>
