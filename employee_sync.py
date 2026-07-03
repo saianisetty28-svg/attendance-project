@@ -6,7 +6,7 @@ SF_USERNAME = "deekshadas2002.b8953bf2b61f@agentforce.com"
 SF_PASSWORD = "deeksha@123"
 SF_SECURITY_TOKEN = "3vmE0GCJL2cJbvlQG9zSOENI9"
 
-CACHE_DIR = r"C:\Users\pranav h r\attendance_system\cache\employee_images"
+CACHE_DIR = r"C:\Users\anjan\Attendance\goldenEye\attendance-project\cache\employee_images"
 
 
 def get_sf():
