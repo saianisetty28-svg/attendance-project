@@ -1,157 +1,252 @@
 import os
-import requests
-from simple_salesforce import Salesforce
+import re
 
-SF_USERNAME = "deekshadas2002.b8953bf2b61f@agentforce.com"
-SF_PASSWORD = "deeksha@123"
-SF_SECURITY_TOKEN = "3vmE0GCJL2cJbvlQG9zSOENI9"
+import cv2
+import numpy as np
+from psycopg2.extras import Json, RealDictCursor
+from insightface.app import FaceAnalysis
 
-CACHE_DIR = r"C:\Users\pranav h r\attendance_system\cache\employee_images"
+from PSqlConnector import get_conn
 
 
-def get_sf():
-    return Salesforce(
-        username=SF_USERNAME,
-        password=SF_PASSWORD,
-        security_token=SF_SECURITY_TOKEN
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EMPLOYEES_DIR = os.path.join(BASE_DIR, "Employess")
+MODEL_NAME = "buffalo_l"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+app = FaceAnalysis(name=MODEL_NAME)
+app.prepare(ctx_id=0, det_size=(640, 640))
+
+
+def normalize_name(value):
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value).strip()).casefold()
+
+
+def fetch_users():
+    query = """
+        SELECT user_id, full_name, empcode
+        FROM public.users
+        WHERE full_name IS NOT NULL
+        ORDER BY user_id
+    """
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(query)
+            rows = cursor.fetchall()
+
+    users_by_name = {}
+    duplicate_names = set()
+
+    for row in rows:
+        normalized = normalize_name(row.get("full_name"))
+        if not normalized:
+            continue
+        if normalized in users_by_name:
+            duplicate_names.add(normalized)
+        users_by_name[normalized] = row
+
+    if duplicate_names:
+        print("WARNING: Duplicate full_name values found in public.users:")
+        for name in sorted(duplicate_names):
+            print(f" - {name}")
+        print("Only the last row returned by user_id order will be used for duplicate names.")
+
+    print(f"Loaded {len(users_by_name)} users from public.users")
+    return users_by_name
+
+
+def iter_employee_folders(employees_dir=EMPLOYEES_DIR):
+    if not os.path.isdir(employees_dir):
+        print(f"ERROR: Employee image folder does not exist: {employees_dir}")
+        return
+
+    for entry in sorted(os.scandir(employees_dir), key=lambda item: item.name.casefold()):
+        if entry.is_dir():
+            yield entry
+
+
+def iter_image_paths(folder_path):
+    for entry in sorted(os.scandir(folder_path), key=lambda item: item.name.casefold()):
+        if not entry.is_file():
+            continue
+        _, ext = os.path.splitext(entry.name)
+        if ext.casefold() in IMAGE_EXTENSIONS:
+            yield entry.path
+
+
+def choose_largest_face(faces):
+    return max(
+        faces,
+        key=lambda face: (face.bbox[2] - face.bbox[0]) * (face.bbox[3] - face.bbox[1]),
     )
 
 
-def chunked(sequence, size):
-    for i in range(0, len(sequence), size):
-        yield sequence[i:i + size]
+def generate_embedding_from_image(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"WARNING: Could not read image: {image_path}")
+        return None
+
+    faces = app.get(img)
+    if not faces:
+        print(f"WARNING: No face found in image: {image_path}")
+        return None
+
+    face = choose_largest_face(faces)
+    embedding = np.asarray(face.embedding, dtype=np.float32)
+    return embedding.tolist()
 
 
-def sync_employees():
+def generate_embeddings_for_folder(folder_path):
+    embeddings = []
 
-    sf = get_sf()
+    image_paths = list(iter_image_paths(folder_path))
+    if not image_paths:
+        print(f"WARNING: No supported images found in folder: {folder_path}")
+        return embeddings
 
-    contacts = sf.query_all("""
-        SELECT Id,
-               Name,
-               Employee__c
-        FROM Contact
-        WHERE Employee__c != NULL
-    """)
+    for image_path in image_paths:
+        embedding = generate_embedding_from_image(image_path)
+        if embedding is None:
+            continue
+        embeddings.append(
+            {
+                "image_path": image_path,
+                "embedding": embedding,
+                "dimension": len(embedding),
+            }
+        )
+        print(f"Generated embedding from {os.path.basename(image_path)}")
 
-    records = contacts.get("records", [])
-    num_contacts = len(records)
-    print(f"Found {num_contacts} contact(s) with Employee__c")
+    return embeddings
 
-    if num_contacts == 0:
-        return
 
-    contact_map = {
-        contact["Id"]: {
-            "employee_id": contact["Employee__c"],
-            "name": contact.get("Name")
-        }
-        for contact in records
+def fetch_existing_embedding_ids(cursor, user_id):
+    cursor.execute(
+        """
+        SELECT embedding_id
+        FROM public.user_face_embeddings
+        WHERE user_id = %s
+          AND model_name = %s
+          AND is_active = TRUE
+        ORDER BY embedding_id
+        """,
+        (user_id, MODEL_NAME),
+    )
+    return [row["embedding_id"] for row in cursor.fetchall()]
+
+
+def sync_user_embeddings(cursor, user_id, embeddings):
+    existing_ids = fetch_existing_embedding_ids(cursor, user_id)
+    update_count = min(len(existing_ids), len(embeddings))
+
+    for index in range(update_count):
+        embedding_data = embeddings[index]
+        cursor.execute(
+            """
+            UPDATE public.user_face_embeddings
+            SET image_id = NULL,
+                embedding = %s,
+                embedding_dimension = %s,
+                is_active = TRUE,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE embedding_id = %s
+            """,
+            (
+                Json(embedding_data["embedding"]),
+                embedding_data["dimension"],
+                existing_ids[index],
+            ),
+        )
+
+    for embedding_data in embeddings[update_count:]:
+        cursor.execute(
+            """
+            INSERT INTO public.user_face_embeddings
+                (user_id, image_id, model_name, embedding, embedding_dimension, is_active)
+            VALUES
+                (%s, NULL, %s, %s, %s, TRUE)
+            """,
+            (
+                user_id,
+                MODEL_NAME,
+                Json(embedding_data["embedding"]),
+                embedding_data["dimension"],
+            ),
+        )
+
+    inactive_ids = existing_ids[update_count:]
+    if inactive_ids:
+        cursor.execute(
+            """
+            UPDATE public.user_face_embeddings
+            SET is_active = FALSE,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE embedding_id = ANY(%s)
+            """,
+            (inactive_ids,),
+        )
+
+    return {
+        "updated": update_count,
+        "inserted": len(embeddings) - update_count,
+        "deactivated": len(inactive_ids),
     }
 
-    contact_ids = list(contact_map.keys())
-    print(f"Loading ContentDocumentLink records for {len(contact_ids)} contacts")
 
-    content_links = []
-    for chunk in chunked(contact_ids, 200):
-        ids_list = ",".join(f"'{contact_id}'" for contact_id in chunk)
-        links = sf.query_all(f"""
-            SELECT ContentDocumentId,
-                   LinkedEntityId
-            FROM ContentDocumentLink
-            WHERE LinkedEntityId IN ({ids_list})
-        """)
-        content_links.extend(links.get("records", []))
+def generate_embeddings_from_employee_folders(employees_dir=EMPLOYEES_DIR):
+    users_by_name = fetch_users()
 
-    print(f"Found {len(content_links)} ContentDocumentLink record(s)")
-    if not content_links:
-        return
+    matched_users = 0
+    total_generated = 0
+    total_updated = 0
+    total_inserted = 0
+    total_deactivated = 0
 
-    content_document_ids = [link["ContentDocumentId"] for link in content_links if link.get("ContentDocumentId")]
-    unique_content_ids = list(dict.fromkeys(content_document_ids))
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            for folder in iter_employee_folders(employees_dir):
+                folder_name = folder.name
+                user = users_by_name.get(normalize_name(folder_name))
 
-    print(f"Loading latest ContentVersion for {len(unique_content_ids)} documents")
+                if user is None:
+                    print(f"WARNING: No public.users match found for folder: {folder_name}")
+                    continue
 
-    version_records = []
-    for chunk in chunked(unique_content_ids, 200):
-        ids_list = ",".join(f"'{doc_id}'" for doc_id in chunk)
-        versions = sf.query_all(f"""
-            SELECT Id,
-                   ContentDocumentId,
-                   Title,
-                   VersionData
-            FROM ContentVersion
-            WHERE ContentDocumentId IN ({ids_list})
-            ORDER BY ContentDocumentId, CreatedDate DESC
-        """)
-        version_records.extend(versions.get("records", []))
+                user_id = user["user_id"]
+                print(f"\nProcessing {folder_name} -> user_id={user_id}")
 
-    latest_versions = {}
-    for version in version_records:
-        doc_id = version["ContentDocumentId"]
-        if doc_id not in latest_versions:
-            latest_versions[doc_id] = version
+                embeddings = generate_embeddings_for_folder(folder.path)
+                if not embeddings:
+                    print(f"WARNING: No valid embeddings generated for {folder_name}")
+                    continue
 
-    links_by_contact = {}
-    for link in content_links:
-        contact_id = link.get("LinkedEntityId")
-        doc_id = link.get("ContentDocumentId")
-        if not contact_id or not doc_id:
-            continue
-        links_by_contact.setdefault(contact_id, []).append(doc_id)
+                result = sync_user_embeddings(cursor, user_id, embeddings)
+                matched_users += 1
+                total_generated += len(embeddings)
+                total_updated += result["updated"]
+                total_inserted += result["inserted"]
+                total_deactivated += result["deactivated"]
 
-    session_id = sf.session_id
-    instance = sf.sf_instance
+                print(
+                    f"Synced {folder_name}: "
+                    f"{result['updated']} updated, "
+                    f"{result['inserted']} inserted, "
+                    f"{result['deactivated']} deactivated"
+                )
 
-    for contact_id, contact_info in contact_map.items():
-        employee_id = contact_info["employee_id"]
-        contact_name = contact_info["name"]
+        conn.commit()
 
-        document_ids = links_by_contact.get(contact_id, [])
-        print(f"Processing contact {contact_name} ({contact_id}) -> employee {employee_id}")
-        print(f"  Found {len(document_ids)} linked file(s)")
+    print("\nEmbedding sync complete.")
+    print(f"Matched users: {matched_users}")
+    print(f"Generated embeddings: {total_generated}")
+    print(f"Updated rows: {total_updated}")
+    print(f"Inserted rows: {total_inserted}")
+    print(f"Deactivated rows: {total_deactivated}")
 
-        employee_folder = os.path.join(CACHE_DIR, employee_id)
-        os.makedirs(employee_folder, exist_ok=True)
-
-        saved_count = 0
-        for doc_id in document_ids:
-            if saved_count >= 5:
-                break
-
-            version = latest_versions.get(doc_id)
-            if not version:
-                print(f"  No ContentVersion found for document {doc_id}")
-                continue
-
-            version_id = version.get("Id")
-            title = version.get("Title") or doc_id
-            version_data = version.get("VersionData")
-            if not version_data:
-                print(f"  No VersionData for ContentVersion {version_id}")
-                continue
-
-            ext = os.path.splitext(title)[1] or ".jpg"
-            file_name = f"img{saved_count + 1}{ext}"
-            url = f"https://{instance}{version_data}"
-
-            headers = {"Authorization": f"Bearer {session_id}"}
-            response = requests.get(url, headers=headers, timeout=30)
-            if response.status_code != 200:
-                print(f"  Failed to download ContentVersion {version_id}: {response.status_code}")
-                continue
-
-            save_path = os.path.join(employee_folder, file_name)
-            with open(save_path, "wb") as f:
-                f.write(response.content)
-
-            print(f"  Saved {file_name} from document {title} ({doc_id})")
-            saved_count += 1
-
-        if saved_count == 0:
-            print(f"  No files synced for contact {contact_id}")
-        else:
-            print(f"  Synced {saved_count} file(s) for employee {employee_id}")
 
 if __name__ == "__main__":
-    sync_employees()
+    generate_embeddings_from_employee_folders()
