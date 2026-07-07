@@ -20,13 +20,14 @@ def cosine_similarity(a, b):
     return float(np.dot(a, b) / (norm_a * norm_b))
 
 
-def find_best_match(embedding, employee_db, threshold=0.55):
+def find_best_match(embedding, employee_db, threshold=0.40, verbose=False):
     """Find the employee with the highest cosine similarity.
 
     Arguments:
     - embedding: query face embedding vector
     - employee_db: dict mapping employee IDs to lists of stored embeddings
     - threshold: minimum similarity required to accept a match
+    - verbose: if True, logs top candidate scores
 
     Returns:
     - (employee_id, score) if best score >= threshold
@@ -36,23 +37,29 @@ def find_best_match(embedding, employee_db, threshold=0.55):
     if embedding.size == 0 or np.linalg.norm(embedding) < EPS:
         return None, 0.0
 
-    best_score = 0.0
-    best_emp = None
+    matches = []
 
     for emp_id, emb_list in employee_db.items():
-        # Allow either a list of embeddings or a single embedding value
         candidates = emb_list if isinstance(emb_list, (list, tuple, np.ndarray)) else [emb_list]
 
         for emb in candidates:
             score = cosine_similarity(embedding, emb)
-            if score > best_score:
-                best_score = score
-                best_emp = emp_id
+            matches.append((emp_id, score))
 
-    if best_score >= threshold:
-        return best_emp, best_score
+    if not matches:
+        return None, 0.0
 
-    return None, best_score
+    matches.sort(key=lambda x: x[1], reverse=True)
+    best_emp, best_score = matches[0]
+
+    if verbose:
+        top_matches = matches[:5]
+        print("    match candidates:")
+        for emp_id, score in top_matches:
+            print(f"      {emp_id}: {score:.4f}")
+        print(f"    best match {best_emp} with score={best_score:.4f} threshold={threshold}")
+
+    return best_emp, best_score
 
 
 if __name__ == "__main__":
