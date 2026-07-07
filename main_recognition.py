@@ -1,144 +1,274 @@
-# =========================================================
-# SECTION 1: IMPORTS
-# =========================================================
-
+import json
 import os
+import re
 import time
-from Frames_Extractor import extract_frames
+from datetime import datetime
+
+import cv2
+
+from attendance_engine import AttendanceEngine
+from embedding_loader import load_embeddings_from_db
+from PSqlConnector import get_conn
+from stabilizer import Stabilizer
+from yolo_processor import process_frame
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
 
 
-# =========================================================
-# SECTION 2: CONFIGURATION
-# =========================================================
-
-VIDEO_FOLDER = r"C:\Users\pranav h r\attendance_system\Videos\1_02_R_20260406012104PM.mp4"
-FRAME_FOLDER = r"C:\Users\pranav h r\attendance_system\Frames"
-SKIP_N_FRAMES = 10
-
-# OCR scans only until it detects the date, then frame extraction restarts from frame 0.
-ENABLE_OCR = True
-OCR_REGION = "top left"  # use "top left", "top", "bottom", or "full"
+FRAME_FOLDER = r"C:\Users\pranav h r\attendance_system\Frames\2026-04-07\1"
 
 
-# =========================================================
-# SECTION 3: RUNTIME HELPERS
-# =========================================================
-
-def format_seconds(seconds):
-    minutes, secs = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-
-    if hours >= 1:
-        return f"{int(hours)}h {int(minutes)}m {secs:.2f}s"
-    if minutes >= 1:
-        return f"{int(minutes)}m {secs:.2f}s"
-    return f"{secs:.2f}s"
+def find_frames(root_folder):
+    """Recursively find all JPG frames under the provided root folder."""
+    for base, _, files in os.walk(root_folder):
+        for file in sorted(files):
+            if file.lower().endswith((".jpg", ".jpeg")):
+                yield os.path.join(base, file)
 
 
-def timed_step(label, func, *args, **kwargs):
-    start_time = time.perf_counter()
-    print(f"START: {label}")
+def _match_timestamp_from_text(text):
+    patterns = [
+        r"(20\d{2}\d{2}\d{2}\d{2}\d{2}\d{2}[APap][Mm])",
+        r"(20\d{2}\d{2}\d{2}\d{2}\d{2}\d{2})",
+        r"(20\d{2}-\d{2}-\d{2}[T_ -]\d{2}[:._-]\d{2}[:._-]\d{2})",
+        r"(20\d{2}-\d{2}-\d{2}[T_ -]\d{2}[:._-]\d{2})",
+        r"(20\d{2}-\d{2}-\d{2})",
+    ]
 
-    result = func(*args, **kwargs)
-
-    elapsed = time.perf_counter() - start_time
-    print(f"END: {label} | runtime={format_seconds(elapsed)}")
-    return result
-
-
-# =========================================================
-# SECTION 4: GET LOCAL VIDEOS
-# =========================================================
-
-def get_local_videos(video_folder):
-    """
-    Reads videos from a local file path or local folder.
-    Returns list of (camera_id, video_path).
-    """
-
-    videos = []
-    valid_extensions = (".mp4", ".avi", ".mov", ".mkv")
-
-    if os.path.isfile(video_folder):
-        file_name = os.path.basename(video_folder)
-        if file_name.lower().endswith(valid_extensions):
-            camera_id = file_name.split("_")[0]
-            videos.append((camera_id, video_folder))
-        return videos
-
-    if not os.path.isdir(video_folder):
-        print("ERROR: VIDEO_FOLDER does not exist or is not a directory:", video_folder)
-        return videos
-
-    for file_name in os.listdir(video_folder):
-        if file_name.lower().endswith(valid_extensions):
-            camera_id = file_name.split("_")[0]
-            video_path = os.path.join(video_folder, file_name)
-            videos.append((camera_id, video_path))
-
-    return videos
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            candidate = match.group(1)
+            for fmt in [
+                "%Y%m%d%I%M%S%p",
+                "%Y%m%d%H%M%S",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%Y-%m-%d %H-%M-%S",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%dT%H:%M",
+                "%Y-%m-%dT%H-%M-%S",
+                "%Y-%m-%d",
+            ]:
+                try:
+                    return datetime.strptime(candidate, fmt)
+                except ValueError:
+                    continue
+    return None
 
 
-# =========================================================
-# SECTION 5: PROCESS SINGLE VIDEO
-# =========================================================
+def _ocr_text_from_image(image, psm=7):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    gray = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+    _, thresh = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, inv_thresh = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-def process_video(camera_id, video_path):
-    print("\n=================================================")
-    print(f"Processing Video: {video_path}")
-    print(f"Camera ID: {camera_id}")
-    print("=================================================")
+    config = f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789:- "
+    for source in (thresh, inv_thresh):
+        try:
+            text = pytesseract.image_to_string(source, config=config)
+        except Exception:
+            continue
 
-    frames = extract_frames(
-        video_id=os.path.basename(video_path),
-        camera_id=camera_id,
-        video_path=video_path,
-        output_dir=FRAME_FOLDER,
-        skip_n_frames=SKIP_N_FRAMES,
-        enable_ocr=ENABLE_OCR,
-        ocr_region=OCR_REGION,
-    )
+        cleaned = re.sub(r"[^0-9A-Za-z:/., _-]", "", text)
+        if cleaned:
+            return cleaned
 
-    print(f"Total Frames Extracted: {len(frames)}")
-    return frames
+    return ""
 
 
-# =========================================================
-# SECTION 6: MAIN PIPELINE
-# =========================================================
+def _extract_timestamp_from_frame(frame_path):
+    if pytesseract is None:
+        return None
+
+    image = cv2.imread(frame_path)
+    if image is None:
+        return None
+
+    height, width = image.shape[:2]
+    crops = [
+        ("top_left", image[0 : max(1, int(height * 0.08)), 0 : max(1, int(width * 0.45))]),
+        ("top_band", image[0 : max(1, int(height * 0.12)), 0:width]),
+        ("full", image),
+    ]
+
+    for region_name, crop in crops:
+        if crop is None or crop.size == 0:
+            continue
+
+        text = _ocr_text_from_image(crop, psm=6)
+        timestamp = _match_timestamp_from_text(text)
+        if timestamp is not None:
+            print(f"[OCR] extracted timestamp {timestamp} from {region_name}")
+            return timestamp
+        if text:
+            print(f"[OCR] region {region_name} text: {text}")
+
+    return None
+
+
+def _is_extracted_frame_filename(frame_path):
+    basename = os.path.basename(frame_path)
+    return bool(re.search(r"frame_\d+", basename))
+
+
+def get_frame_timestamp(frame_path, allow_ocr=False):
+    if allow_ocr and pytesseract is not None:
+        timestamp = _extract_timestamp_from_frame(frame_path)
+        if timestamp is not None:
+            return timestamp
+        print(f"[OCR] no timestamp read from {os.path.basename(frame_path)}; falling back to filename/mtime")
+
+    if not _is_extracted_frame_filename(frame_path):
+        timestamp = parse_frame_timestamp(frame_path)
+        if timestamp is not None:
+            return timestamp
+
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(frame_path))
+    except Exception:
+        return None
+
+
+def parse_frame_timestamp(frame_path):
+    path_text = os.path.abspath(frame_path)
+
+    patterns = [
+        r"(\d{14}[APap][Mm])",
+        r"(\d{4}\d{2}\d{2}\d{2}\d{2}\d{2})",
+        r"(\d{4}-\d{2}-\d{2}[T_ -]\d{2}[._-]\d{2}[._-]\d{2})",
+        r"(\d{4}-\d{2}-\d{2})",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, path_text)
+        if match:
+            candidate = match.group(1)
+            for fmt in [
+                "%Y%m%d%I%M%S%p",
+                "%Y%m%d%H%M%S",
+                "%Y-%m-%d %H-%M-%S",
+                "%Y-%m-%dT%H-%M-%S",
+                "%Y-%m-%d",
+            ]:
+                try:
+                    return datetime.strptime(candidate, fmt)
+                except ValueError:
+                    continue
+
+    return None
+
 
 def run():
-    total_start = time.perf_counter()
-    print("Attendance Frame Extraction System Started\n")
+    print("Loading employee embeddings from PostgreSQL...")
 
-    videos = timed_step("scan input videos", get_local_videos, VIDEO_FOLDER)
-
-    if not videos:
-        print("ERROR: No videos found:", VIDEO_FOLDER)
+    employee_db, employee_meta = load_embeddings_from_db()
+    if not employee_db:
+        print("No active embeddings found in public.user_face_embeddings")
         return
 
-    print(f"Found {len(videos)} videos\n")
+    stabilizer = Stabilizer(window=3, min_score=0.15)
+    conn = get_conn()
+    engine = AttendanceEngine(conn=conn)
 
-    total_frames = 0
-    for camera_id, video_path in videos:
-        frames = timed_step(
-            f"process video {os.path.basename(video_path)}",
-            process_video,
-            camera_id,
-            video_path,
+    start_time = time.perf_counter()
+    print("Processing frames with YOLO + Face Recognition...\n")
+
+    if not os.path.isdir(FRAME_FOLDER):
+        print("❌ FRAME_FOLDER does not exist:", FRAME_FOLDER)
+        return
+
+    frame_count = 0
+    event_count = 0
+
+    for frame_path in find_frames(FRAME_FOLDER):
+        frame_count += 1
+        print(f"PROCESSING FRAME {frame_count}: {os.path.basename(frame_path)}")
+        results, person_detected = process_frame(
+            frame_path,
+            employee_db,
+            employee_meta=employee_meta,
+            verbose=True,
+            frame_id=frame_count,
         )
-        total_frames += len(frames)
-        time.sleep(1)
 
-    total_elapsed = time.perf_counter() - total_start
-    print("\nALL VIDEOS PROCESSED SUCCESSFULLY")
-    print(f"Total frames extracted: {total_frames}")
-    print(f"Total runtime: {format_seconds(total_elapsed)}")
+        event_timestamp = get_frame_timestamp(frame_path, allow_ocr=True)
+        if event_timestamp is None:
+            event_timestamp = datetime.fromtimestamp(os.path.getmtime(frame_path))
 
+        if not results:
+            if person_detected:
+                print(f"    PERSON detected in frame {frame_count}, no face match results. Recording UNKNOWN event.")
+                event = engine.create_event(
+                    emp_id=None,
+                    camera_id="CAM1",
+                    confidence=0.0,
+                    timestamp=event_timestamp,
+                    user_id=None,
+                    event_type="UNKNOWN",
+                    notes="Person detected but face match or face extraction failed",
+                    status="CREATED",
+                )
+                if event:
+                    print(json.dumps(event, indent=4))
+                    event_count += 1
+            continue
+        if event_timestamp is None:
+            event_timestamp = datetime.fromtimestamp(os.path.getmtime(frame_path))
 
-# =========================================================
-# SECTION 7: ENTRY POINT
-# =========================================================
+        for result in results:
+            user_id = result.get("user_id")
+            score = result.get("score", 0.0)
+            accepted = result.get("accepted", False)
+
+            if user_id is None:
+                event = engine.create_event(
+                    emp_id=None,
+                    camera_id="CAM1",
+                    confidence=score,
+                    timestamp=event_timestamp,
+                    user_id=None,
+                    event_type="UNKNOWN",
+                    notes="No confident employee match found",
+                    status="CREATED",
+                )
+                if event:
+                    print(json.dumps(event, indent=4))
+                    event_count += 1
+                continue
+
+            confirmed = stabilizer.update(user_id, score=score, min_score=0.15)
+            if confirmed:
+                event = engine.create_event(
+                    emp_id=confirmed,
+                    camera_id="CAM1",
+                    confidence=score,
+                    timestamp=event_timestamp,
+                    user_id=confirmed,
+                    event_type="CHECKIN",
+                    notes=f"Matched {employee_meta.get(confirmed, {}).get('full_name', 'employee')}",
+                    status="CREATED",
+                )
+                if event:
+                    print(json.dumps(event, indent=4))
+                    event_count += 1
+            else:
+                if accepted:
+                    print(f"    candidate {user_id} score={score:.4f} waiting for stability")
+                else:
+                    print(f"    candidate {user_id} score={score:.4f} below stable threshold")
+
+    engine.close()
+    elapsed = time.perf_counter() - start_time
+    print(f"\nProcessed {frame_count} frames in {elapsed:.2f} seconds")
+    print(f"Created {event_count} attendance events")
+
 
 if __name__ == "__main__":
     run()
